@@ -1,200 +1,165 @@
 package bguspl.set.ex;
-import java.util.Random;
-import java.util.Vector;
+
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingDeque;
 
 import bguspl.set.Env;
-import bguspl.set.UserInterface; 
 
 /**
- * This class manages the players' threads and data
+ * Manages a single player's state and threads.
  *
  * @inv id >= 0
  * @inv score >= 0
  */
 public class Player implements Runnable {
-    boolean theDealerIsRemoving;//cant keypress if true(the dealer is removing cards)
-    boolean foundset;// waiting until the dealer check the set
-    boolean badToken;// to change one of the bad selections of the player after penalty
-    public int[] playerSlots;
-    boolean inFreeze;
-    private BlockingQueue<Integer> queue;
- 
 
-    protected int tokensCounter;
+    // ----------------------
+    // Runtime state flags
+    // ----------------------
+    private boolean theDealerIsRemoving; // when dealer is removing cards, player should not keypress
+    private boolean foundset;            // true once player has placed 3 tokens (candidate set)
+    private boolean badToken;            // marks that a bad selection happened (after penalty)
+    private boolean inFreeze;            // player is frozen (point/penalty)
+    private volatile boolean terminate;  // termination signal
 
-    
-    /**
-     * The game environment object.
-     */
+    // ----------------------
+    // Player token state
+    // ----------------------
+    private final int[] playerSlots;          // tracked slots selected by this player (-1 = empty)
+    private int tokensCounter;                // number of active tokens for this player (0..3)
+    private final BlockingQueue<Integer> queue; // keypress queue (capacity 3)
+
+    // ----------------------
+    // Game context
+    // ----------------------
     private final Env env;
-
-    /**
-     * Game entities.
-     */
     private final Table table;
+    private final Dealer dealer;
 
-    /**
-     * The id of the player (starting from 0).
-     */
+    // ----------------------
+    // Identity & threading
+    // ----------------------
     public final int id;
-
-    /**
-     * The thread representing the current player.
-     */
+    private final boolean human;
     private Thread playerThread;
-
-    /**
-     * The thread of the AI (computer) player (an additional thread used to generate
-     * key presses).
-     */
     private Thread aiThread;
 
-    /**
-     * True iff the player is human (not a computer player).
-     */
-    private final boolean human;
-
-    /**
-     * True iff game should be terminated.
-     */
-    private volatile boolean terminate;
-
-    /**
-     * The current score of the player.
-     */
+    // ----------------------
+    // Score
+    // ----------------------
     private int score;
 
-    private Dealer dealer;// check this
-
     /**
-     * The class constructor.
-     *
-     * @param env    - the environment object.
-     * @param dealer - the dealer object.
-     * @param table  - the table object.
-     * @param id     - the id of the player.
-     * @param human  - true iff the player is a human player (i.e. input is provided
-     *               manually, via the keyboard).
+     * Constructor.
      */
     public Player(Env env, Dealer dealer, Table table, int id, boolean human) {
-        theDealerIsRemoving= false;
-        foundset = false;
-        playerSlots = new int[3];
-        for (int i = 0; i < 3; i++) {
-            playerSlots[i] = -1;
-        }
-        badToken = false;
-        inFreeze = false;
-        queue = new LinkedBlockingDeque<Integer>(3);
-        tokensCounter = 0;
-        this.dealer = dealer;
         this.env = env;
+        this.dealer = dealer;
         this.table = table;
         this.id = id;
         this.human = human;
 
+        this.theDealerIsRemoving = false;
+        this.foundset = false;
+        this.badToken = false;
+        this.inFreeze = false;
+        this.terminate = false;
+
+        this.playerSlots = new int[3];
+        for (int i = 0; i < 3; i++) playerSlots[i] = -1;
+
+        this.queue = new LinkedBlockingDeque<>(3);
+        this.tokensCounter = 0;
+        this.score = 0;
     }
 
     /**
-     * The main player thread of each player starts here (main loop for the player
-     * thread).
+     * Main player loop.
      */
     @Override
     public void run() {
         playerThread = Thread.currentThread();
-        env.logger.info("thread " + Thread.currentThread().getName() + " starting.");
-        if (!human)
-            createArtificialIntelligence();
-        // boolean once= false;
+        env.logger.info("thread " + playerThread.getName() + " starting.");
+
+        if (!human) createArtificialIntelligence();
+
         while (!terminate) {
-            // TODO implement main player loop
+            // Once player has 3 tokens and is not frozen, handle set check path
             if (tokensCounter == 3 && !inFreeze && !badToken) {
-                if(dealer.setFound){
-                   if(!dealer.ifCommon(id)){
-                    while( dealer.setFound){
+                if (dealer.setFound) {
+                    // If another player's set is being processed, wait it out
+                    if (!dealer.ifCommon(id)) {
+                        while (dealer.setFound) {
+                            if (terminate) break;
+                            // busy-wait as in original logic
+                        }
+                        if (terminate) break;
+
+                        if (dealer.checkIfSet(id)) {
+                            queue.clear();
+                            point();
+                        } else {
+                            penalty();
+                            if (!human) {
+                                // remove a random token (same behavior as your code)
+                                int randomIdx = (int) (Math.random() * playerSlots.length);
+                                table.removeToken(id, playerSlots[randomIdx]);
+                                removePlayerToken(playerSlots[randomIdx]);
+                            }
+                        }
                     }
-                    if (dealer.checkIfSet(id)) {
-                        queue.clear();
-                        point();
-                    } else {
-                       
-                        penalty();
-                        if(!human){
-                            int randomkey;
-                            randomkey = (int) (Math.random() * playerSlots.length) +0;
-                            table.removeToken(id, playerSlots[randomkey]);
-                            removePlayerToken(playerSlots[randomkey]);
-                
-                    }
-                    }
-                   }
-                }
-                else{
-                
-                if (dealer.checkIfSet(id)) {
-                    point();
-                    queue.clear();
                 } else {
-                   
-                    penalty();
-                    if(!human){
-                        int randomkey;
-                        randomkey = (int) (Math.random() * playerSlots.length) +0;
-                        table.removeToken(id, playerSlots[randomkey]);
-                        removePlayerToken(playerSlots[randomkey]);
-            
+                    if (dealer.checkIfSet(id)) {
+                        point();
+                        queue.clear();
+                    } else {
+                        penalty();
+                        if (!human) {
+                            int randomIdx = (int) (Math.random() * playerSlots.length);
+                            table.removeToken(id, playerSlots[randomIdx]);
+                            removePlayerToken(playerSlots[randomIdx]);
+                        }
+                    }
                 }
-                }
-            } 
             }
+
             foundset = false;
+
+            // Wake AI so it can continue after point/penalty
             if (!human) {
-                synchronized(this){
-                    // queue.clear();
+                synchronized (this) {
                     notifyAll();
-    
                 }
             }
-           
-        
         }
 
-        if (!human)
+        if (!human) {
             try {
                 aiThread.join();
-            } catch (InterruptedException ignored) {
-            }
+            } catch (InterruptedException ignored) {}
+        }
+
         env.logger.info("thread " + Thread.currentThread().getName() + " terminated.");
     }
 
     /**
-     * Creates an additional thread for an AI (computer) player. The main loop of
-     * this thread repeatedly generates
-     * key presses. If the queue of key presses is full, the thread waits until it
-     * is not full.
+     * AI thread that simulates key presses for computer players.
      */
     private void createArtificialIntelligence() {
-        // note: this is a very, very smart AI (!)
         aiThread = new Thread(() -> {
             env.logger.info("thread " + Thread.currentThread().getName() + " starting.");
-            while (!terminate)   {
-                // TODO implement player key press simulator
-                while( tokensCounter<3){
-                    if(terminate)  
-                       break;
-                int randomkey;
-                randomkey = (int) (Math.random() * env.config.tableSize) +0;
-                keyPressed(randomkey);
-            }
+            while (!terminate) {
+                // generate keys while fewer than 3 tokens
+                while (!terminate && tokensCounter < 3) {
+                    int randomSlot = (int) (Math.random() * env.config.tableSize);
+                    keyPressed(randomSlot);
+                }
 
                 try {
                     synchronized (this) {
-                        wait();/////for what, point or penaltty
+                        wait(); // wait for point/penalty handling to finish
                     }
-                } catch (InterruptedException ignored) {
-                }
+                } catch (InterruptedException ignored) {}
             }
             env.logger.info("thread " + Thread.currentThread().getName() + " terminated.");
         }, "computer-" + id);
@@ -202,300 +167,180 @@ public class Player implements Runnable {
     }
 
     /**
-     * Called when the game should be terminated.
+     * Request player termination.
      */
     public void terminate() {
-        // TODO implement
         terminate = true;
-        synchronized(this){
+        synchronized (this) {
             notifyAll();
         }
-
     }
 
     /**
-     * This method is called when a key is pressed.
-     *
-     * @param slot - the slot corresponding to the key pressed.
+     * Called when a key (slot) is pressed for this player.
      */
     public void keyPressed(int slot) {
-        // TODO implement
-        //// we sould check if the player is in plenty
+        // Bounds & state checks
+        if (slot < 0 || slot >= env.config.tableSize) return;
 
-        if (table.slotToCard[slot] != null && !inFreeze && !foundset && !theDealerIsRemoving ) {
-            if (tokensCounter < 3 && tokensCounter>=0) {
+        if (table.slotToCard[slot] != null && !inFreeze && !foundset && !theDealerIsRemoving) {
+            if (tokensCounter >= 0 && tokensCounter < 3) {
                 if (checkIfTokened(slot)) {
                     table.removeToken(id, slot);
                     removePlayerToken(slot);
-                    // queue.remove(slot);
-
-
                 } else {
-                    if(queue.size()<3){
-                    table.placeToken(id, slot);
-                    placePlayerToken(slot);
-                    // queue.add(slot);
-                    //queue.put(slot);
-                    badToken = false;
+                    if (queue.size() < 3) {
+                        table.placeToken(id, slot);
+                        placePlayerToken(slot);
+                        badToken = false;
+                    }
                 }
-                }
-            } 
-            else {
+            } else { // tokensCounter == 3
                 if (checkIfTokened(slot)) {
                     table.removeToken(id, slot);
                     removePlayerToken(slot);
-                    // queue.remove(slot);
-
-                    
                 }
             }
-
         }
-
     }
 
+    /**
+     * Build a card array matching the currently selected player slots.
+     */
     public int[] returnArray() {
         int[] cards = new int[3];
         for (int i = 0; i < playerSlots.length; i++) {
-            if(playerSlots[i]!=-1 && table.slotToCard[playerSlots[i]] != null)
+            if (playerSlots[i] != -1 && table.slotToCard[playerSlots[i]] != null)
                 cards[i] = table.slotToCard[playerSlots[i]];
-
         }
         return cards;
     }
 
+    /**
+     * @return true if player has a token on the given slot.
+     */
     public boolean checkIfTokened(int slot) {
-
-        for (Integer currSlot : playerSlots) {
-            if (currSlot!=-1 && currSlot == slot)
-                return true;
+        for (int s : playerSlots) {
+            if (s != -1 && s == slot) return true;
         }
         return false;
     }
 
+    /**
+     * Remove a token from player state and queue.
+     */
     public void removePlayerToken(int slot) {
         for (int i = 0; i < playerSlots.length; i++) {
-            if (playerSlots[i] == slot && tokensCounter>0){
+            if (playerSlots[i] == slot && tokensCounter > 0) {
                 playerSlots[i] = -1;
                 tokensCounter--;
                 queue.remove(slot);
             }
-           
         }
-       
-       
     }
 
+    /**
+     * Remove all player tokens (local state only).
+     */
     public void removeAllPlayreTokens() {
         for (int i = 0; i < playerSlots.length; i++) {
-            if(playerSlots[i]!=-1 ){
+            if (playerSlots[i] != -1) {
                 playerSlots[i] = -1;
                 tokensCounter--;
             }
-             
         }
-
     }
 
+    /**
+     * Place a player token in local state & queue.
+     */
     public void placePlayerToken(int slot) {
-        boolean foundPlace = false;
-
-        for (int i = 0; i < playerSlots.length && !foundPlace; i++) {
+        boolean placed = false;
+        for (int i = 0; i < playerSlots.length && !placed; i++) {
             if (playerSlots[i] == -1) {
                 playerSlots[i] = slot;
-                foundPlace = true;
+                placed = true;
                 tokensCounter++;
                 queue.add(slot);
             }
         }
-      
-        if (tokensCounter == 3)
-            foundset = true;
-
+        if (tokensCounter == 3) foundset = true;
     }
 
     /**
-     * Award a point to a player and perform other related actions.
-     *
-     * @post - the player's score is increased by 1.
-     * @post - the player's score is updated in the ui.
+     * Award a point and freeze player according to config.
+     * @post score increases by 1 and UI updated.
      */
     public void point() {
-        // TODO implement
         inFreeze = true;
         score++;
         long freeze = env.config.pointFreezeMillis;
         env.ui.setScore(id, score);
 
-        // after scoring a point the player should be frozen
         while (freeze > 0) {
-
             synchronized (Thread.currentThread()) {
                 env.ui.setFreeze(id, freeze);
-
-                if (freeze < 1000 && freeze > 0) {
-                    try {
-
-                        Thread.sleep(freeze);
-
-                    } catch (InterruptedException ignored) {
-                    }
+                if (freeze < 1000) {
+                    try { Thread.sleep(freeze); } catch (InterruptedException ignored) {}
                     freeze = 0;
-                    env.ui.setFreeze(id, freeze);
                 } else {
-                    try {
-                        Thread.sleep(1000);
-                    } catch (InterruptedException e) {
-                    }
-                    freeze = freeze - 1000;
+                    try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+                    freeze -= 1000;
                 }
             }
         }
-        // inPenalty=false;
-        env.ui.setFreeze(id, freeze);
-        int ignored = table.countCards(); // this part is just for demonstration in the unit tests
-        inFreeze = false;
-       
 
+        env.ui.setFreeze(id, 0);
+        int ignored = table.countCards(); // as in original code (for unit tests)
+        inFreeze = false;
     }
 
+    /**
+     * Apply penalty and freeze player according to config.
+     */
     public void penalty() {
-        // TODO implement
         inFreeze = true;
         badToken = true;
         long freeze = env.config.penaltyFreezeMillis;
 
-        // after scoring a point the player should be frozen
         while (freeze > 0) {
-
             synchronized (Thread.currentThread()) {
                 env.ui.setFreeze(id, freeze);
-
-                if (freeze < 1000 && freeze > 0) {
-                    try {
-
-                        Thread.sleep(freeze);
-
-                    } catch (InterruptedException ignored) {
-                    }
+                if (freeze < 1000) {
+                    try { Thread.sleep(freeze); } catch (InterruptedException ignored) {}
                     freeze = 0;
-                    env.ui.setFreeze(id, freeze);
                 } else {
-                    try {
-                        Thread.sleep(1000);
-                    } catch (InterruptedException e) {
-                    }
-                    freeze = freeze - 1000;
+                    try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+                    freeze -= 1000;
                 }
             }
         }
-        // inPenalty=false;
-        env.ui.setFreeze(id, freeze);
-        int ignored = table.countCards(); // this part is just for demonstration in the unit tests
+
+        env.ui.setFreeze(id, 0);
+        int ignored = table.countCards(); // as in original code (for unit tests)
         inFreeze = false;
-       
-}
+    }
 
     public int score() {
         return score;
     }
 
-
-    ///// when the 1 minute end 
+    /** Called when a new turn starts (e.g., after the minute ends). */
     public void newturn() {
-       
         removeAllPlayreTokens();
         queue.clear();
         inFreeze = false;
         badToken = false;
-        tokensCounter=0;
-        
+        tokensCounter = 0;
     }
 
-    
-    public void cantPress(){
-        if(theDealerIsRemoving){
-        theDealerIsRemoving=false;}
-        else{
-        theDealerIsRemoving=true;}
-
+    /** Toggle the "dealer is removing" flag. */
+    public void cantPress() {
+        theDealerIsRemoving = !theDealerIsRemoving;
     }
 
-
-
-
-
-    public void checkTokensQueue(){
-        while(queue.size()>tokensCounter)
-            queue.remove();
-  
-  
-      }
-
+    /** Keep queue size aligned with tokensCounter (as in original design intent). */
+    public void checkTokensQueue() {
+        while (queue.size() > tokensCounter) queue.remove();
+    }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
